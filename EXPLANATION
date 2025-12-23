@@ -1,0 +1,161 @@
+Awesome idea, Yanwei — using **Pybricks** on SPIKE Prime with the hub’s gyro to close the loop on turns, and driving your **LeftMotor**/**RightMotor** as a differential pair. Below is a compact, practical LQR-style heading controller that you can drop into your project. It uses the hub IMU for **heading** and **yaw rate** and commands opposite motor speeds to rotate on the spot.
+
+> **Why this works:** we define the state (x=\[\theta\_\text{error},\ \omega]), where (\theta\_\text{error}=\theta\_\text{target}-\theta) (deg) and (\omega) is yaw rate (deg/s). An LQR gain (K=\[k\_\theta,\ k\_\omega]) gives (u=-Kx). We convert (u) (desired yaw rate) to motor speed by a small one-time calibration.
+
+***
+
+## Key Pybricks IMU & Motor APIs we use
+
+*   `hub.imu.heading()` — returns heading in degrees; positive clockwise, accumulates beyond 180°. [\[docs.pybricks.com\]](https://docs.pybricks.com/en/latest/hubs/primehub.html)
+*   `hub.imu.angular_velocity(Axis.Z)` — gives angular velocity (yaw rate) in deg/s. [\[docs.pybricks.com\]](https://docs.pybricks.com/en/latest/hubs/primehub.html)
+*   `hub.imu.reset_heading(angle)` — resets accumulated heading; must not be called while a drive base is using the gyro. [\[docs.pybricks.com\]](https://docs.pybricks.com/en/latest/hubs/primehub.html)
+*   IMU readiness helpers: `hub.imu.ready()`, `hub.imu.stationary()` for auto-calibration behavior. [\[docs.pybricks.com\]](https://docs.pybricks.com/en/latest/hubs/primehub.html)
+*   Motor speed control: `Motor.run(speed_deg_per_s)` (PID speed control) and `Motor.stop(then=Stop.BRAKE/HOLD/COAST)`. [\[docs.pybricks.com\]](https://docs.pybricks.com/en/stable/pupdevices/motor.html), [\[github.com\]](https://github.com/pybricks/pybricks-api/blob/master/examples/pup/motor/motor_action_then.py)
+
+> Note: `hub.imu.heading()` currently assumes a flat surface; lifting or turning on ramps breaks the heading estimate. (There is an experimental `'3D'` heading option mentioned in the docs.) [\[docs.pybricks.com\]](https://docs.pybricks.com/en/latest/hubs/primehub.html)
+
+***
+
+## Full example: LQR turn function (Pybricks MicroPython)
+
+Adjust **ports/directions** to match your build (e.g., A for left, B for right). The gains provided are safe defaults; you can tune later.
+
+```python
+# lqr_turn.py — Pybricks on SPIKE Prime
+from pybricks.hubs import PrimeHub
+from pybricks.pupdevices import Motor
+from pybricks.parameters import Port, Direction, Stop, Axis
+from pybricks.tools import wait, StopWatch
+
+# --- Hardware setup (edit these for your robot) ---
+hub = PrimeHub()
+LeftMotor  = Motor(Port.A, Direction.CLOCKWISE)
+RightMotor = Motor(Port.B, Direction.COUNTERCLOCKWISE)
+
+# --- Controller parameters ---
+DT_MS = 10                     # control loop period (ms)
+MAX_SPEED = 600                # motor speed limit (deg/s) to avoid wheel skid
+K_theta = 0.9                  # LQR gain on heading error (deg -> deg/s)
+K_omega = 0.25                 # LQR gain on yaw rate (deg/s -> deg/s)
+k_cmd   = 1.0                  # yaw-rate-to-motor-speed scale (deg/s -> deg/s), set by calibration
+
+# --- Optional: quick calibration of k_cmd (maps motor speed to yaw rate) ---
+def calibrate_k_cmd(test_speed=300, duration_ms=800):
+    """Run motors in opposite directions briefly and measure average yaw rate."""
+    # Ensure IMU is ready/calibrated (robot stationary) before sampling
+    while not hub.imu.ready():
+        wait(50)  # give hub a moment to auto-calibrate when stationary
+    # Spin on the spot
+    LeftMotor.run(+test_speed)
+    RightMotor.run(-test_speed)
+    sw = StopWatch()
+    samples = []
+    while sw.time() < duration_ms:
+        omega = hub.imu.angular_velocity(Axis.Z)  # deg/s (yaw rate)  # uses calibrated gyro by default
+        samples.append(omega)
+        wait(DT_MS)
+    # Stop motors and compute mapping
+    LeftMotor.stop(Stop.BRAKE)
+    RightMotor.stop(Stop.BRAKE)
+    if len(samples) < 10:
+        return 1.0
+    avg_omega = sum(samples) / len(samples)
+    # β ≈ ω_measured / test_speed  -> to achieve ω_ref, we need motor_speed ≈ ω_ref / β
+    beta = max(1e-3, abs(avg_omega) / float(test_speed))
+    return 1.0 / beta  # k_cmd = 1/β
+
+# --- Core LQR turn (absolute) ---
+def turn_to(target_deg, tol_deg=1.0, settle_ms=250, timeout_ms=6000, brake_mode=Stop.BRAKE):
+    """
+    Turn to an absolute heading (deg, positive clockwise).
+    Uses LQR on [heading error, yaw rate] and exits when error & rate are small for 'settle_ms'.
+    """
+    # Safety: only reset heading when not held by a drive base
+    hub.imu.reset_heading(0)  # heading starts at 0 for this turn  # reset API requirement
+    wait(40)                  # small delay for stability
+
+    # If k_cmd has not been calibrated, do it once
+    global k_cmd
+    if k_cmd == 1.0:
+        k_cmd = calibrate_k_cmd()
+
+    sw_total = StopWatch()
+    sw_settle = StopWatch()
+    sw_settle.reset()
+
+    while sw_total.time() < timeout_ms:
+        # Read state: heading error and yaw rate
+        theta = hub.imu.heading()                       # deg, +clockwise from start
+        omega = hub.imu.angular_velocity(Axis.Z)        # deg/s yaw rate
+        e = target_deg - theta
+
+        # LQR control law: u is desired yaw rate (deg/s)
+        u = -(K_theta * e + K_omega * omega)
+
+        # Convert to motor speeds and saturate
+        cmd = max(-MAX_SPEED, min(MAX_SPEED, k_cmd * u))
+        LeftMotor.run(+cmd)
+        RightMotor.run(-cmd)
+
+        # Settling logic: require low error and low rate for 'settle_ms'
+        if abs(e) <= tol_deg and abs(omega) <= 3.0:
+            if sw_settle.time() >= settle_ms:
+                break
+        else:
+            sw_settle.reset()
+
+        wait(DT_MS)
+
+    # Stop motors cleanly
+    LeftMotor.stop(brake_mode)
+    RightMotor.stop(brake_mode)
+
+# --- Convenience: relative turn (e.g., turn_by(+90)) ---
+def turn_by(delta_deg, **kwargs):
+    # current heading is 0 right after reset; command directly
+    return turn_to(delta_deg, **kwargs)
+
+# --- Example usage (uncomment for testing) ---
+# turn_by(+90)    # turn 90° clockwise
+# wait(500)
+# turn_by(-90)    # turn 90° counter-clockwise
+```
+
+**What the code does:**
+
+*   Reads **heading** and **yaw rate** each loop and applies (u=-K\_\theta e - K\_\omega \omega). (APIs: `heading()`, `angular_velocity()`.) [\[docs.pybricks.com\]](https://docs.pybricks.com/en/latest/hubs/primehub.html)
+*   Converts (u) (deg/s) to motor speed with a **one-shot calibration** (`calibrate_k_cmd()`), using IMU yaw rate while spinning at a known speed. (IMU readiness via `hub.imu.ready()`.) [\[docs.pybricks.com\]](https://docs.pybricks.com/en/latest/hubs/primehub.html)
+*   Resets the IMU heading safely via `hub.imu.reset_heading(0)` before starting the turn. (Per docs, don’t reset heading while a drive base is actively using the gyro.) [\[docs.pybricks.com\]](https://docs.pybricks.com/en/latest/hubs/primehub.html)
+*   Commands **opposite wheel speeds** with `Motor.run()`, which is Pybricks’ **speed-controlled** mode (PID-based). [\[docs.pybricks.com\]](https://docs.pybricks.com/en/stable/pupdevices/motor.html), [\[quirkycort.github.io\]](https://quirkycort.github.io/tutorials/110-Pybricks-Basics/99-Special-Topics/30-Run-vs-DC.html)
+*   Stops with `Stop.BRAKE` so the robot doesn’t drift after finishing. (Examples show how different `Stop` modes behave.) [\[github.com\]](https://github.com/pybricks/pybricks-api/blob/master/examples/pup/motor/motor_action_then.py)
+
+***
+
+## Tuning tips
+
+1.  **K gains**  
+    Start with `K_theta` in the range **0.6–1.2** and `K_omega` in **0.15–0.35**. Higher `K_theta` reduces steady error but can overshoot; higher `K_omega` damps oscillation.
+
+2.  **Sampling & speed limits**  
+    Keep `DT_MS` between **8–15 ms**. Raise `MAX_SPEED` only if your tires don’t slip; otherwise low speed yields better accuracy.
+
+3.  **IMU calibration & environment**  
+    Make sure the robot sits **stationary** before starting (the IMU auto-calibrates when stationary), and turn on a **flat surface** to avoid heading drift. [\[docs.pybricks.com\]](https://docs.pybricks.com/en/latest/hubs/primehub.html)
+
+4.  **Motor directions**  
+    If your robot turns the wrong way, swap `Direction.CLOCKWISE`/`COUNTERCLOCKWISE` or ports, then rerun calibration. (Motor API details & defaults in docs.) [\[docs.pybricks.com\]](https://docs.pybricks.com/en/stable/pupdevices/motor.html)
+
+***
+
+## Alternatives / built-ins
+
+If you prefer a built-in controller, Pybricks’ `DriveBase` supports gyro-based turning and heading reset — simpler to use but less “control theory fun.” (Resetting heading while the drive base is *holding* a turn can cause abrupt corrections, as discussed by Pybricks maintainers.) [\[github.com\]](https://github.com/orgs/pybricks/discussions/1767)
+
+***
+
+## Next steps
+
+*   Want me to tailor **K** based on your wheel diameter, axle track, and maximum motor speed? Share your **ports (A/B/C/D)**, wheel size, and measured 360° turn time, and I’ll compute gains matched to your robot.
+*   We can also add **battery compensation** (to keep turn speed consistent as voltage drops) and a **2D LQR solver** if you want fully “computed” gains rather than hand-tuned.
+
+If you run into anything (e.g., the turn overshoots by \~5–10°), send me your logs of `e` and `omega` during a 90° turn, and I’ll help refine the gains.
